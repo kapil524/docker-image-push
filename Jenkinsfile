@@ -35,24 +35,34 @@ pipeline {
                 ]]) {
                     script {
                         // Find existing EC2 instances with our tag
-                        def OLD_INSTANCES = sh(script: """aws ec2 describe-instances \
-                            --filters "Name=tag:Name,Values=$TAG_NAME" "Name=instance-state-name,Values=running,stopped" \
-                            --query 'Reservations[*].Instances[*].InstanceId' --output text --region $REGION""", returnStdout: true).trim()
+                        def OLD_INSTANCES = sh(script: """
+                            aws ec2 describe-instances \
+                                --filters "Name=tag:Name,Values=$TAG_NAME" "Name=instance-state-name,Values=running,stopped" \
+                                --query 'Reservations[*].Instances[*].InstanceId' \
+                                --output text --region $REGION
+                        """, returnStdout: true).trim()
 
                         if (OLD_INSTANCES) {
                             echo "Terminating old EC2 instance(s): $OLD_INSTANCES"
-                            sh "aws ec2 terminate-instances --instance-ids $OLD_INSTANCES --region $REGION"
-                            sh "aws ec2 wait instance-terminated --instance-ids $OLD_INSTANCES --region $REGION"
+                            sh "aws ec2 terminate-instances --instance-ids ${OLD_INSTANCES} --region $REGION"
+                            sh "aws ec2 wait instance-terminated --instance-ids ${OLD_INSTANCES} --region $REGION"
+                        } else {
+                            echo "No old EC2 instances found with tag $TAG_NAME"
                         }
 
-                        // Find old SGs with our tag
-                        def OLD_SG = sh(script: """aws ec2 describe-security-groups \
-                            --filters "Name=tag:Name,Values=$TAG_NAME" \
-                            --query 'SecurityGroups[*].GroupId' --output text --region $REGION""", returnStdout: true).trim()
+                        // Find old Security Groups with our tag
+                        def OLD_SG = sh(script: """
+                            aws ec2 describe-security-groups \
+                                --filters "Name=tag:Name,Values=$TAG_NAME" \
+                                --query 'SecurityGroups[*].GroupId' \
+                                --output text --region $REGION
+                        """, returnStdout: true).trim()
 
                         if (OLD_SG) {
                             echo "Deleting old Security Group(s): $OLD_SG"
-                            sh "aws ec2 delete-security-group --group-id $OLD_SG --region $REGION || true"
+                            sh "aws ec2 delete-security-group --group-id ${OLD_SG} --region $REGION || true"
+                        } else {
+                            echo "No old Security Groups found with tag $TAG_NAME"
                         }
                     }
                 }
@@ -68,26 +78,34 @@ pipeline {
                     script {
                         sh 'mkdir -p /var/lib/jenkins/.ssh && chmod 700 /var/lib/jenkins/.ssh'
 
-                        // Key pair creation
-                        def keyExists = sh(script: """aws ec2 describe-key-pairs \
-                            --key-names $KEY_NAME --region $REGION --query 'KeyPairs[0].KeyName' --output text || echo 'NOT_FOUND'""", returnStdout: true).trim()
+                        // Key pair creation if not exists
+                        def keyExists = sh(script: """
+                            aws ec2 describe-key-pairs --key-names $KEY_NAME --region $REGION \
+                            --query 'KeyPairs[0].KeyName' --output text || echo 'NOT_FOUND'
+                        """, returnStdout: true).trim()
+
                         if (keyExists == 'NOT_FOUND') {
-                            sh """aws ec2 create-key-pair --key-name $KEY_NAME --query 'KeyMaterial' --output text > $SSH_KEY_PATH
-                            chmod 400 $SSH_KEY_PATH"""
+                            sh """
+                            aws ec2 create-key-pair --key-name $KEY_NAME --query 'KeyMaterial' --output text > $SSH_KEY_PATH
+                            chmod 400 $SSH_KEY_PATH
+                            """
                             echo "Key pair created: $KEY_NAME"
                         } else {
                             echo "Key pair already exists: $KEY_NAME"
                         }
 
-                        // Create SG
-                        def SG_ID = sh(script: """aws ec2 create-security-group \
-                            --group-name flask-sg-$BUILD_NUMBER \
-                            --description "Flask SG for Jenkins deployment" \
-                            --vpc-id $VPC_ID \
-                            --tag-specifications 'ResourceType=security-group,Tags=[{Key=Name,Value=$TAG_NAME}]' \
-                            --region $REGION \
-                            --query 'GroupId' --output text""", returnStdout: true).trim()
+                        // Create Security Group
+                        def SG_ID = sh(script: """
+                            aws ec2 create-security-group \
+                                --group-name flask-sg-$BUILD_NUMBER \
+                                --description "Flask SG for Jenkins deployment" \
+                                --vpc-id $VPC_ID \
+                                --tag-specifications 'ResourceType=security-group,Tags=[{Key=Name,Value=$TAG_NAME}]' \
+                                --region $REGION \
+                                --query 'GroupId' --output text
+                        """, returnStdout: true).trim()
 
+                        // Open ports
                         sh "aws ec2 authorize-security-group-ingress --group-id ${SG_ID} --protocol tcp --port 22 --cidr 0.0.0.0/0 --region $REGION"
                         sh "aws ec2 authorize-security-group-ingress --group-id ${SG_ID} --protocol tcp --port 80 --cidr 0.0.0.0/0 --region $REGION"
 
@@ -99,29 +117,35 @@ pipeline {
                         systemctl enable docker
                         usermod -aG docker ubuntu
                         '''
-                        def INSTANCE_ID = sh(script: """aws ec2 run-instances \
-                            --image-id $AMI_ID \
-                            --count 1 \
-                            --instance-type $INSTANCE_TYPE \
-                            --key-name $KEY_NAME \
-                            --security-group-ids ${SG_ID} \
-                            --subnet-id $SUBNET_ID \
-                            --associate-public-ip-address \
-                            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=$TAG_NAME}]' \
-                            --region $REGION \
-                            --user-data "$USER_DATA" \
-                            --query 'Instances[0].InstanceId' --output text""", returnStdout: true).trim()
+                        def INSTANCE_ID = sh(script: """
+                            aws ec2 run-instances \
+                                --image-id $AMI_ID \
+                                --count 1 \
+                                --instance-type $INSTANCE_TYPE \
+                                --key-name $KEY_NAME \
+                                --security-group-ids ${SG_ID} \
+                                --subnet-id $SUBNET_ID \
+                                --associate-public-ip-address \
+                                --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=$TAG_NAME}]' \
+                                --region $REGION \
+                                --user-data "$USER_DATA" \
+                                --query 'Instances[0].InstanceId' --output text
+                        """, returnStdout: true).trim()
                         echo "EC2 Instance Created: ${INSTANCE_ID}"
 
-                        // Wait & get public IP
+                        // Wait until EC2 is ready
                         sh "aws ec2 wait instance-status-ok --instance-ids ${INSTANCE_ID} --region $REGION"
-                        def PUBLIC_IP = sh(script: """aws ec2 describe-instances \
-                            --instance-ids ${INSTANCE_ID} \
-                            --query 'Reservations[0].Instances[0].PublicIpAddress' \
-                            --output text --region $REGION""", returnStdout: true).trim()
+
+                        // Get Public IP
+                        def PUBLIC_IP = sh(script: """
+                            aws ec2 describe-instances \
+                                --instance-ids ${INSTANCE_ID} \
+                                --query 'Reservations[0].Instances[0].PublicIpAddress' \
+                                --output text --region $REGION
+                        """, returnStdout: true).trim()
                         echo "EC2 Public IP: ${PUBLIC_IP}"
 
-                        // SSH & deploy container
+                        // Deploy Docker container
                         sh """
                         ssh -o StrictHostKeyChecking=no -i $SSH_KEY_PATH ubuntu@${PUBLIC_IP} \\
                             "docker login -u $DOCKERHUB_USR -p $DOCKERHUB_PSW && \\
