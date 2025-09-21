@@ -34,7 +34,7 @@ pipeline {
                     credentialsId: "${AWS_CRED}"
                 ]]) {
                     script {
-                        // Find existing EC2 instances with our tag
+                        // Find old EC2 instances with our tag
                         def OLD_INSTANCES = sh(script: """
                             aws ec2 describe-instances \
                                 --filters "Name=tag:Name,Values=$TAG_NAME" "Name=instance-state-name,Values=running,stopped" \
