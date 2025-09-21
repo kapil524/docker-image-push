@@ -1,8 +1,8 @@
 pipeline {
     agent any
     environment {
-        DOCKERHUB = credentials('kmanwani-dockerhub')   // Docker Hub creds
-        AWS_CRED = 'aws-credentials-kapil'             // Jenkins AWS creds
+        DOCKERHUB = credentials('kmanwani-dockerhub')
+        AWS_CRED = 'aws-credentials-kapil'
         IMAGE_NAME = "flask-image"
         REPO = "kmanwani"
         CONTAINER_NAME = "flask-app"
@@ -15,6 +15,7 @@ pipeline {
         SUBNET_ID = "subnet-0d3310d1bf0a05c9f"
         KEY_NAME = "jenkins-ec2-key"
         SSH_KEY_PATH = "/var/lib/jenkins/.ssh/jenkins-ec2-key.pem"
+        TAG_NAME = "flask-app-deployment"
     }
 
     stages {
@@ -26,6 +27,32 @@ pipeline {
             }
         }
 
+        stage('Cleanup Old EC2 & SG') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: "${AWS_CRED}"
+                ]]) {
+                    script {
+                        // Find existing EC2 instance with our tag
+                        def OLD_INSTANCE = sh(script: """aws ec2 describe-instances --filters "Name=tag:Name,Values=$TAG_NAME" "Name=instance-state-name,Values=running,stopped" --query 'Reservations[*].Instances[*].InstanceId' --output text --region $REGION""", returnStdout: true).trim()
+                        if (OLD_INSTANCE) {
+                            echo "Terminating old EC2 instance(s): $OLD_INSTANCE"
+                            sh "aws ec2 terminate-instances --instance-ids $OLD_INSTANCE --region $REGION"
+                            sh "aws ec2 wait instance-terminated --instance-ids $OLD_INSTANCE --region $REGION"
+                        }
+
+                        // Find old SG with our tag
+                        def OLD_SG = sh(script: """aws ec2 describe-security-groups --filters "Name=tag:Name,Values=$TAG_NAME" --query 'SecurityGroups[*].GroupId' --output text --region $REGION""", returnStdout: true).trim()
+                        if (OLD_SG) {
+                            echo "Deleting old Security Group(s): $OLD_SG"
+                            sh "aws ec2 delete-security-group --group-id $OLD_SG --region $REGION"
+                        }
+                    }
+                }
+            }
+        }
+
         stage('Setup EC2 & Deploy Container') {
             steps {
                 withCredentials([[
@@ -33,10 +60,9 @@ pipeline {
                     credentialsId: "${AWS_CRED}"
                 ]]) {
                     script {
-                        // Ensure SSH directory exists
                         sh 'mkdir -p /var/lib/jenkins/.ssh && chmod 700 /var/lib/jenkins/.ssh'
 
-                        // 1️⃣ Create key pair if it doesn't exist
+                        // Key pair creation
                         def keyExists = sh(script: """aws ec2 describe-key-pairs --key-names $KEY_NAME --region $REGION --query 'KeyPairs[0].KeyName' --output text || echo 'NOT_FOUND'""", returnStdout: true).trim()
                         if (keyExists == 'NOT_FOUND') {
                             sh """aws ec2 create-key-pair --key-name $KEY_NAME --query 'KeyMaterial' --output text > $SSH_KEY_PATH
@@ -46,20 +72,18 @@ pipeline {
                             echo "Key pair already exists: $KEY_NAME"
                         }
 
-                        // 2️⃣ Create Security Group
+                        // Create SG
                         def SG_ID = sh(script: """aws ec2 create-security-group \
                             --group-name flask-sg-$BUILD_NUMBER \
                             --description "Flask SG for Jenkins deployment" \
                             --vpc-id $VPC_ID \
+                            --tag-specifications 'ResourceType=security-group,Tags=[{Key=Name,Value=$TAG_NAME}]' \
                             --region $REGION \
                             --query 'GroupId' --output text""", returnStdout: true).trim()
-                        echo "Created Security Group: ${SG_ID}"
-
-                        // Allow SSH and HTTP inbound
                         sh "aws ec2 authorize-security-group-ingress --group-id ${SG_ID} --protocol tcp --port 22 --cidr 0.0.0.0/0 --region $REGION"
                         sh "aws ec2 authorize-security-group-ingress --group-id ${SG_ID} --protocol tcp --port 80 --cidr 0.0.0.0/0 --region $REGION"
 
-                        // 3️⃣ Launch EC2 with Docker via user-data
+                        // Launch EC2
                         def USER_DATA = '''#!/bin/bash
                         apt-get update -y
                         apt-get install -y docker.io
@@ -75,22 +99,21 @@ pipeline {
                             --security-group-ids ${SG_ID} \
                             --subnet-id $SUBNET_ID \
                             --associate-public-ip-address \
+                            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=$TAG_NAME}]' \
                             --region $REGION \
                             --user-data "$USER_DATA" \
                             --query 'Instances[0].InstanceId' --output text""", returnStdout: true).trim()
                         echo "EC2 Instance Created: ${INSTANCE_ID}"
 
-                        // 4️⃣ Wait for instance to be ready
+                        // Wait & get public IP
                         sh "aws ec2 wait instance-status-ok --instance-ids ${INSTANCE_ID} --region $REGION"
-
-                        // 5️⃣ Get public IP
                         def PUBLIC_IP = sh(script: """aws ec2 describe-instances \
                             --instance-ids ${INSTANCE_ID} \
                             --query 'Reservations[0].Instances[0].PublicIpAddress' \
                             --output text --region $REGION""", returnStdout: true).trim()
                         echo "EC2 Public IP: ${PUBLIC_IP}"
 
-                        // 6️⃣ SSH and deploy Docker container
+                        // SSH & deploy container
                         sh """
                         ssh -o StrictHostKeyChecking=no -i $SSH_KEY_PATH ubuntu@${PUBLIC_IP} \\
                             "docker login -u $DOCKERHUB_USR -p $DOCKERHUB_PSW && \\
