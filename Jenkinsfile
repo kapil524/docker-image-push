@@ -34,19 +34,25 @@ pipeline {
                     credentialsId: "${AWS_CRED}"
                 ]]) {
                     script {
-                        // Find existing EC2 instance with our tag
-                        def OLD_INSTANCE = sh(script: """aws ec2 describe-instances --filters "Name=tag:Name,Values=$TAG_NAME" "Name=instance-state-name,Values=running,stopped" --query 'Reservations[*].Instances[*].InstanceId' --output text --region $REGION""", returnStdout: true).trim()
-                        if (OLD_INSTANCE) {
-                            echo "Terminating old EC2 instance(s): $OLD_INSTANCE"
-                            sh "aws ec2 terminate-instances --instance-ids $OLD_INSTANCE --region $REGION"
-                            sh "aws ec2 wait instance-terminated --instance-ids $OLD_INSTANCE --region $REGION"
+                        // Find existing EC2 instances with our tag
+                        def OLD_INSTANCES = sh(script: """aws ec2 describe-instances \
+                            --filters "Name=tag:Name,Values=$TAG_NAME" "Name=instance-state-name,Values=running,stopped" \
+                            --query 'Reservations[*].Instances[*].InstanceId' --output text --region $REGION""", returnStdout: true).trim()
+
+                        if (OLD_INSTANCES) {
+                            echo "Terminating old EC2 instance(s): $OLD_INSTANCES"
+                            sh "aws ec2 terminate-instances --instance-ids $OLD_INSTANCES --region $REGION"
+                            sh "aws ec2 wait instance-terminated --instance-ids $OLD_INSTANCES --region $REGION"
                         }
 
-                        // Find old SG with our tag
-                        def OLD_SG = sh(script: """aws ec2 describe-security-groups --filters "Name=tag:Name,Values=$TAG_NAME" --query 'SecurityGroups[*].GroupId' --output text --region $REGION""", returnStdout: true).trim()
+                        // Find old SGs with our tag
+                        def OLD_SG = sh(script: """aws ec2 describe-security-groups \
+                            --filters "Name=tag:Name,Values=$TAG_NAME" \
+                            --query 'SecurityGroups[*].GroupId' --output text --region $REGION""", returnStdout: true).trim()
+
                         if (OLD_SG) {
                             echo "Deleting old Security Group(s): $OLD_SG"
-                            sh "aws ec2 delete-security-group --group-id $OLD_SG --region $REGION"
+                            sh "aws ec2 delete-security-group --group-id $OLD_SG --region $REGION || true"
                         }
                     }
                 }
@@ -63,7 +69,8 @@ pipeline {
                         sh 'mkdir -p /var/lib/jenkins/.ssh && chmod 700 /var/lib/jenkins/.ssh'
 
                         // Key pair creation
-                        def keyExists = sh(script: """aws ec2 describe-key-pairs --key-names $KEY_NAME --region $REGION --query 'KeyPairs[0].KeyName' --output text || echo 'NOT_FOUND'""", returnStdout: true).trim()
+                        def keyExists = sh(script: """aws ec2 describe-key-pairs \
+                            --key-names $KEY_NAME --region $REGION --query 'KeyPairs[0].KeyName' --output text || echo 'NOT_FOUND'""", returnStdout: true).trim()
                         if (keyExists == 'NOT_FOUND') {
                             sh """aws ec2 create-key-pair --key-name $KEY_NAME --query 'KeyMaterial' --output text > $SSH_KEY_PATH
                             chmod 400 $SSH_KEY_PATH"""
@@ -80,6 +87,7 @@ pipeline {
                             --tag-specifications 'ResourceType=security-group,Tags=[{Key=Name,Value=$TAG_NAME}]' \
                             --region $REGION \
                             --query 'GroupId' --output text""", returnStdout: true).trim()
+
                         sh "aws ec2 authorize-security-group-ingress --group-id ${SG_ID} --protocol tcp --port 22 --cidr 0.0.0.0/0 --region $REGION"
                         sh "aws ec2 authorize-security-group-ingress --group-id ${SG_ID} --protocol tcp --port 80 --cidr 0.0.0.0/0 --region $REGION"
 
