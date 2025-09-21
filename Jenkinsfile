@@ -55,7 +55,8 @@ pipeline {
                             --query 'GroupId' --output text""", returnStdout: true).trim()
                         echo "Created Security Group: ${SG_ID}"
 
-                        // Add port 80 inbound
+                        // Allow SSH and HTTP inbound
+                        sh "aws ec2 authorize-security-group-ingress --group-id ${SG_ID} --protocol tcp --port 22 --cidr 0.0.0.0/0 --region $REGION"
                         sh "aws ec2 authorize-security-group-ingress --group-id ${SG_ID} --protocol tcp --port 80 --cidr 0.0.0.0/0 --region $REGION"
 
                         // 3️⃣ Launch EC2 with Docker via user-data
@@ -73,6 +74,7 @@ pipeline {
                             --key-name $KEY_NAME \
                             --security-group-ids ${SG_ID} \
                             --subnet-id $SUBNET_ID \
+                            --associate-public-ip-address \
                             --region $REGION \
                             --user-data "$USER_DATA" \
                             --query 'Instances[0].InstanceId' --output text""", returnStdout: true).trim()
