@@ -1,42 +1,165 @@
 pipeline {
     agent any
     environment {
-        DOCKERHUB = credentials('kmanwani-dockerhub')   // Docker Hub credentials
+        DOCKERHUB = credentials('kmanwani-dockerhub')
+        AWS_CRED = 'aws-credentials-kapil'
         IMAGE_NAME = "flask-image"
-        REPO = "kmanwani"   // Docker Hub username
-        CONTAINER_NAME = "flask-app"  // Name of container on server
-        PORT = "80"                  // Port to expose
+        REPO = "kmanwani"
+        CONTAINER_NAME = "flask-app"
+        HOST_PORT = "80"
+        CONTAINER_PORT = "8080"
+        REGION = "ap-south-1"
+        AMI_ID = "ami-02d26659fd82cf299"
+        INSTANCE_TYPE = "t2.micro"
+        VPC_ID = "vpc-0c87ced4dceaa7034"
+        SUBNET_ID = "subnet-0d3310d1bf0a05c9f"
+        KEY_NAME = "jenkins-ec2-key"
+        SSH_KEY_PATH = "/var/lib/jenkins/.ssh/jenkins-ec2-key.pem"
+        TAG_NAME = "flask-app-deployment"
     }
+
     stages {
-        stage('Build Docker Image') {
+        stage('Build & Push Docker Image') {
             steps {
                 sh 'docker build -t $REPO/$IMAGE_NAME:$BUILD_NUMBER .'
-            }
-        }
-        stage('Login to DockerHub') {
-            steps {
                 sh 'echo $DOCKERHUB_PSW | docker login -u $DOCKERHUB_USR --password-stdin'
-            }
-        }
-        stage('Push Docker Image') {
-            steps {
                 sh 'docker push $REPO/$IMAGE_NAME:$BUILD_NUMBER'
             }
         }
-        stage('Run Docker Container') {
+
+        stage('Cleanup Old EC2 & SG') {
             steps {
-                // Stop existing container (if any) and remove it
-                sh '''
-                if [ $(docker ps -a -q -f name=$CONTAINER_NAME) ]; then
-                    docker stop $CONTAINER_NAME
-                    docker rm $CONTAINER_NAME
-                fi
-                '''
-                // Run new container on port 80
-                sh 'docker run -d --name $CONTAINER_NAME -p $PORT:8080 $REPO/$IMAGE_NAME:$BUILD_NUMBER'
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: "${AWS_CRED}"
+                ]]) {
+                    script {
+                        // Find old EC2 instances with our tag
+                        def OLD_INSTANCES = sh(script: """
+                            aws ec2 describe-instances \
+                                --filters "Name=tag:Name,Values=$TAG_NAME" "Name=instance-state-name,Values=running,stopped" \
+                                --query 'Reservations[*].Instances[*].InstanceId' \
+                                --output text --region $REGION
+                        """, returnStdout: true).trim()
+
+                        if (OLD_INSTANCES) {
+                            echo "Terminating old EC2 instance(s): $OLD_INSTANCES"
+                            sh "aws ec2 terminate-instances --instance-ids ${OLD_INSTANCES} --region $REGION"
+                            sh "aws ec2 wait instance-terminated --instance-ids ${OLD_INSTANCES} --region $REGION"
+                        } else {
+                            echo "No old EC2 instances found with tag $TAG_NAME"
+                        }
+
+                        // Find old Security Groups with our tag
+                        def OLD_SG = sh(script: """
+                            aws ec2 describe-security-groups \
+                                --filters "Name=tag:Name,Values=$TAG_NAME" \
+                                --query 'SecurityGroups[*].GroupId' \
+                                --output text --region $REGION
+                        """, returnStdout: true).trim()
+
+                        if (OLD_SG) {
+                            echo "Deleting old Security Group(s): $OLD_SG"
+                            sh "aws ec2 delete-security-group --group-id ${OLD_SG} --region $REGION || true"
+                        } else {
+                            echo "No old Security Groups found with tag $TAG_NAME"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Setup EC2 & Deploy Container') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: "${AWS_CRED}"
+                ]]) {
+                    script {
+                        sh 'mkdir -p /var/lib/jenkins/.ssh && chmod 700 /var/lib/jenkins/.ssh'
+
+                        // Key pair creation if not exists
+                        def keyExists = sh(script: """
+                            aws ec2 describe-key-pairs --key-names $KEY_NAME --region $REGION \
+                            --query 'KeyPairs[0].KeyName' --output text || echo 'NOT_FOUND'
+                        """, returnStdout: true).trim()
+
+                        if (keyExists == 'NOT_FOUND') {
+                            sh """
+                            aws ec2 create-key-pair --key-name $KEY_NAME --query 'KeyMaterial' --output text > $SSH_KEY_PATH
+                            chmod 400 $SSH_KEY_PATH
+                            """
+                            echo "Key pair created: $KEY_NAME"
+                        } else {
+                            echo "Key pair already exists: $KEY_NAME"
+                        }
+
+                        // Create Security Group
+                        def SG_ID = sh(script: """
+                            aws ec2 create-security-group \
+                                --group-name flask-sg-$BUILD_NUMBER \
+                                --description "Flask SG for Jenkins deployment" \
+                                --vpc-id $VPC_ID \
+                                --tag-specifications 'ResourceType=security-group,Tags=[{Key=Name,Value=$TAG_NAME}]' \
+                                --region $REGION \
+                                --query 'GroupId' --output text
+                        """, returnStdout: true).trim()
+
+                        // Open ports
+                        sh "aws ec2 authorize-security-group-ingress --group-id ${SG_ID} --protocol tcp --port 22 --cidr 0.0.0.0/0 --region $REGION"
+                        sh "aws ec2 authorize-security-group-ingress --group-id ${SG_ID} --protocol tcp --port 80 --cidr 0.0.0.0/0 --region $REGION"
+
+                        // Launch EC2
+                        def USER_DATA = '''#!/bin/bash
+                        apt-get update -y
+                        apt-get install -y docker.io
+                        systemctl start docker
+                        systemctl enable docker
+                        usermod -aG docker ubuntu
+                        '''
+                        def INSTANCE_ID = sh(script: """
+                            aws ec2 run-instances \
+                                --image-id $AMI_ID \
+                                --count 1 \
+                                --instance-type $INSTANCE_TYPE \
+                                --key-name $KEY_NAME \
+                                --security-group-ids ${SG_ID} \
+                                --subnet-id $SUBNET_ID \
+                                --associate-public-ip-address \
+                                --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=$TAG_NAME}]' \
+                                --region $REGION \
+                                --user-data "$USER_DATA" \
+                                --query 'Instances[0].InstanceId' --output text
+                        """, returnStdout: true).trim()
+                        echo "EC2 Instance Created: ${INSTANCE_ID}"
+
+                        // Wait until EC2 is ready
+                        sh "aws ec2 wait instance-status-ok --instance-ids ${INSTANCE_ID} --region $REGION"
+
+                        // Get Public IP
+                        def PUBLIC_IP = sh(script: """
+                            aws ec2 describe-instances \
+                                --instance-ids ${INSTANCE_ID} \
+                                --query 'Reservations[0].Instances[0].PublicIpAddress' \
+                                --output text --region $REGION
+                        """, returnStdout: true).trim()
+                        echo "EC2 Public IP: ${PUBLIC_IP}"
+
+                        // Deploy Docker container
+                        sh """
+                        ssh -o StrictHostKeyChecking=no -i $SSH_KEY_PATH ubuntu@${PUBLIC_IP} \\
+                            "docker login -u $DOCKERHUB_USR -p $DOCKERHUB_PSW && \\
+                             docker pull $REPO/$IMAGE_NAME:$BUILD_NUMBER && \\
+                             docker stop $CONTAINER_NAME || true && \\
+                             docker rm $CONTAINER_NAME || true && \\
+                             docker run -d --name $CONTAINER_NAME -p $HOST_PORT:$CONTAINER_PORT $REPO/$IMAGE_NAME:$BUILD_NUMBER"
+                        """
+                    }
+                }
             }
         }
     }
+
     post {
         always {
             sh 'docker logout'
